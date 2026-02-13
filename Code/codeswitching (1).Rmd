@@ -1,0 +1,180 @@
+---
+title: "Corpus"
+author: "Memoo Guo"
+date: "2025-08-12"
+output: html_document
+---
+
+```{r}
+# Step 1: Identify the most frequent language pair and filter the dataset
+# -----------------------------------------------------------------------
+# Load required packages
+library(dplyr)
+library(tidyr)
+
+# Read the corpus data (tab-separated text file)
+df <- read.delim("/Users/memoo/Desktop/Codeswitching/CS Corpus Prediction/BangorCorpus.txt", header=TRUE, sep="\t", quote="", stringsAsFactors=FALSE)
+
+# Determine the two most frequent languages in the corpus (ignoring "CS" and "amb" labels)
+lang_counts <- table(df$DefaultLg)
+top_langs <- names(sort(lang_counts, decreasing=TRUE))[1:2]   # e.g., c("eng", "spa")
+
+# Filter to keep only utterances from this language pair (e.g., English–Spanish)
+df_pair <- df %>%
+  filter(DefaultLg %in% top_langs) %>%             # retain utterances where DefaultLg is one of the top two languages
+  rowwise() %>%
+  filter({
+    # Check that all words in the utterance belong to the target languages or are ambiguous (no other language like Welsh)
+    tokens <- strsplit(Utterance, ",")[[1]]
+    codes  <- sub(".*\\.", "", tokens)            # extract language code suffix from each token (text after last '.')
+    all(codes %in% c(top_langs, "amb"))           # keep utterance only if *all* tokens are in the target languages or "amb"
+  }) %>%
+  ungroup()
+# (Utterances containing any other language, e.g. Welsh, are removed by the filter above.)
+
+# Step 2: Split each utterance into word-level rows with POS and language code
+# ---------------------------------------------------------------------------
+# Expand the 'Utterance' and 'Syntax' fields so that each word and its POS tag become one row
+df_words <- df_pair %>%
+  mutate(
+    words    = strsplit(Utterance, ","),       # list-column: split utterance into individual tokens (e.g., "hello.eng", "hola.spa")
+    pos_tags = strsplit(Syntax, "\\.")         # list-column: split POS tags for each token
+  ) %>%
+  unnest(c(words, pos_tags))                   # unnest the lists to get one-row-per-word
+
+# After unnesting, each original utterance is now broken into multiple rows (one per word).
+# Extract the word text and its language code from each token:
+df_words <- df_words %>%
+  mutate(
+    word_lang = sub(".*\\.", "", words),        # language code suffix (e.g., "eng" or "spa" or "amb")
+    word      = sub("\\.[^.]*$", "", words)     # actual word (remove the trailing ".xxx" language tag)
+  )
+
+# (Optional sanity check: ensure the word count matches POS tag count for each utterance)
+stopifnot(all(df_pair$UttLengthWords == lengths(strsplit(df_pair$Utterance, ","))))
+stopifnot(all(df_pair$UttLengthWords == lengths(strsplit(df_pair$Syntax, "\\."))))
+
+# Step 3: Assign sequential sentence IDs within each dialogue and unique dialogue IDs
+# -----------------------------------------------------------------------------------
+# Assign each utterance a sequential sentence_id within its dialogue (Soundfile)
+sentence_map <- df_words %>%
+  distinct(Soundfile, UttNum) %>%               # get unique utterances by dialogue
+  arrange(Soundfile, UttNum) %>%                # sort by dialogue and original utterance order
+  group_by(Soundfile) %>%
+  mutate(sentence_id = row_number()) %>%        # number the utterances 1, 2, 3, ... within each Soundfile
+  ungroup()
+# Merge the sentence IDs back to the word-level data
+df_words <- df_words %>%
+  left_join(sentence_map, by=c("Soundfile", "UttNum"))
+
+# Assign each dialogue (Soundfile) a unique dialogue_id
+dialogue_map <- df_words %>%
+  distinct(Soundfile) %>%
+  mutate(dialogue_id = row_number())            # assign 1, 2, 3, ... for each distinct Soundfile
+df_words <- df_words %>%
+  left_join(dialogue_map, by="Soundfile")
+
+# Add a word_index for the position of each word within its sentence
+df_words <- df_words %>%
+  group_by(dialogue_id, sentence_id) %>%
+  mutate(word_index = row_number()) %>%         # index words 1, 2, 3, ... within each utterance
+  ungroup()
+
+# Step 4: Create the final tidy data frame with the specified columns
+# -------------------------------------------------------------------
+tidy_data <- df_words %>%
+  select(
+    dialogue_id,
+    soundfile    = Soundfile,   # original Soundfile identifier (dialogue name)
+    sentence_id,                # utterance index within the dialogue
+    speaker      = Speaker,     # speaker code
+    word_index,                 # position of the word in the utterance
+    word,                       # word token
+    word_lang,                  # language code of the word (from suffix)
+    pos_tag      = pos_tags,    # part-of-speech tag for the word
+    lang_label   = Lang,        # language label of the utterance (e.g., "eng", "spa", "CS", "amb")
+    default_lang = DefaultLg    # default/base language of the utterance (speaker's main language)
+  ) %>%
+  arrange(dialogue_id, sentence_id, word_index)  # sort the output by dialogue and sentence order
+```
+
+```{r}
+write.csv(tidy_data, "tidy_corpus.csv")
+```
+
+
+```{r}
+# --- 0. Setup ---
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# --- 1. Load tidy data ---
+# Basic ordering (just to be safe)
+tidy <- tidy_data %>%
+  arrange(dialogue_id, sentence_id, word_index)
+
+# --- 2. Keep the dominant bilingual pair only ---
+# drop 'amb' before counting, then take top-2 languages by token counts
+top2 <- tidy %>%
+  filter(!is.na(word_lang), word_lang != "amb") %>%
+  count(word_lang, sort = TRUE) %>%
+  slice(1:2) %>%
+  pull(word_lang)
+
+# If you know it's "eng" and "spa", you can hard-set:
+# top2 <- c("eng","spa")
+
+# Keep only tokens from those two languages
+data <- tidy %>%
+  filter(word_lang %in% top2)
+
+# Define L1/L2 (by frequency): L1 = most frequent, L2 = second
+lang_rank <- data %>%
+  count(word_lang, sort = TRUE) %>%
+  pull(word_lang)
+L1 <- lang_rank[1]
+L2 <- lang_rank[2]
+message("L1 = ", L1, " ; L2 = ", L2)
+
+# --- 3. Feature Engineering (within-sentence lags) ---
+# We compute previous token's language and POS INSIDE each sentence.
+data <- data %>%
+  group_by(dialogue_id, sentence_id) %>%
+  arrange(word_index, .by_group = TRUE) %>%
+  mutate(
+    Prev_Language = lag(word_lang),
+    Prev_POS      = lag(pos_tag)
+  ) %>%
+  ungroup()
+
+# Binary targets/predictors for L2 state
+data <- data %>%
+  mutate(
+    Prev_State_L2    = ifelse(Prev_Language == L2, 1L, 0L),
+    Current_State_L2 = ifelse(word_lang    == L2, 1L, 0L)
+  )
+
+# Drop first word in each sentence (no previous token), and any missing tags
+model_data <- data %>%
+  filter(!is.na(Prev_Language), !is.na(Prev_POS)) %>%
+  mutate(
+    # Ensure categorical variables are factors
+    Prev_POS = factor(Prev_POS),
+    speaker  = factor(speaker)
+  ) %>%
+  select(Current_State_L2, Prev_State_L2, Prev_POS, speaker)
+
+# --- 4. Fit logistic regression: P(S_t = L2 | S_{t-1}, x_t) ---
+transition_model <- glm(
+  Current_State_L2 ~ Prev_State_L2 + Prev_POS + speaker,
+  data   = model_data,
+  family = binomial(link = "logit")
+)
+
+# --- 5. Inspect results ---
+summary(transition_model)
+
+```
+
