@@ -1,0 +1,237 @@
+---
+title: "HMM Code-Switching — Simulation Study"
+subtitle: "Can the model recover what we put in?"
+author: "Hanrui Mei"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: true
+    theme: flatly
+execute:
+  warning: false
+  message: false
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+library(tidyverse)
+library(depmixS4)
+library(pROC)
+set.seed(42)
+```
+
+We have two hidden states: **state 1 = English mode**, **state 2 =
+Spanish mode**.
+
+### π — starting language
+
+```{r}
+data <- readRDS("../Data/cs_processed.rds")
+data |>
+  group_by(dialogue_id, sentence_id) |>
+  slice_head(n = 1) |>
+  ungroup() |>
+  count(word_lang) |>
+  mutate(prop = n / sum(n))
+pi_true <- c(0.64, 0.36) 
+```
+
+### A — switching probability
+
+```{r}
+# A[i, j] = P(next token is in state j | current token is in state i)
+p_switch <- 0.018  
+A_true <- matrix(c(1 - p_switch,     p_switch,
+                       p_switch, 1 - p_switch),
+                 nrow = 2, byrow = TRUE)
+rownames(A_true) <- c("from eng", "from spa")
+colnames(A_true) <- c("to eng",   "to spa")
+
+cat("A =\n"); print(round(A_true, 4))
+
+```
+
+### B — what POS each language tends to produce
+
+```{r}
+# B[k, v] = P(POS tag = v | hidden state = k)
+# Note: if B[1,] and B[2,] are very similar, POS gives no information
+
+
+POS_LABELS <- c("noun", "verb", "det", "prep", "other")
+V <- length(POS_LABELS)
+
+# English POS distribution 
+B_eng <- c(noun = 0.28, verb = 0.22, det = 0.18, prep = 0.14, other = 0.18)
+# Spanish POS distribution 
+B_spa <- c(noun = 0.30, verb = 0.26, det = 0.10, prep = 0.12, other = 0.22)
+
+B_true <- rbind(B_eng, B_spa)
+rownames(B_true) <- c("eng mode", "spa mode")
+
+cat("B (emission probabilities):\n")
+print(round(B_true, 3))
+```
+
+```{r}
+data |>
+  filter(!is.na(prev_y)) |>
+  group_by(y, pos_fac) |>
+  summarise(n = n(), .groups = "drop") |>
+  pivot_wider(names_from = y, values_from = n, values_fill = 0) |>
+  rename(eng = `0`, spa = `1`) |>
+  mutate(total = eng + spa,
+         frac_spa = spa / total) |>
+  arrange(desc(abs(frac_spa - 0.5))) |>
+  knitr::kable(caption = "POS distribution by language (frac_spa = proportion Spanish)")
+
+```
+
+------------------------------------------------------------------------
+
+## 3. Simulating sequences
+
+```{r}
+#' Returns a tibble with columns: t, state (true hidden), obs (POS index).
+simulate_hmm <- function(T, pi, A, B) {
+  K <- nrow(A); V <- ncol(B)
+  states <- integer(T)
+  obs    <- integer(T)
+  states[1] <- sample(K, 1, prob = pi)
+  obs[1]    <- sample(V, 1, prob = B[states[1], ])
+
+  for (t in 2:T) {
+    states[t] <- sample(K, 1, prob = A[states[t - 1], ])
+    obs[t]    <- sample(V, 1, prob = B[states[t], ])
+  }
+  tibble(
+    t      = seq_len(T),
+    state  = states,
+    obs    = obs,
+    switch = c(0L, as.integer(diff(states) != 0))
+  )
+}
+
+# Simulate 500 sentences of length 8 
+SENT_LEN <- 8
+
+sims <- map(seq_len(N_SENTS), ~ simulate_hmm(SENT_LEN, pi_true, A_true, B_true))
+sim_df <- bind_rows(sims, .id = "sentence_id") |>
+  mutate(sentence_id = as.integer(sentence_id),
+         obs_fac = factor(obs, levels = 1:V, labels = POS_LABELS))
+
+cat("Total tokens simulated:", nrow(sim_df), "\n")
+cat("Observed switch rate:",
+    round(mean(sim_df$switch[sim_df$t > 1]), 4), "\n")
+cat("True switch rate (A off-diagonal):", p_switch, "\n")
+```
+
+```{r}
+#ex
+sample_sent <- sims[[478]]
+
+sample_sent |>
+  mutate(
+    lang  = if_else(state == 1, "English", "Spanish"),
+    pos   = factor(obs, levels = 1:V, labels = POS_LABELS)
+  ) |>
+  ggplot(aes(t, 1, fill = lang, label = pos)) +
+  geom_tile(height = 0.6, colour = "white", linewidth = 1.2) +
+  geom_text(aes(y = 1), size = 4, fontface = "bold") +
+  scale_fill_manual(values = c(English = "#2c7bb6", Spanish = "#d7191c"),
+                    name = "True hidden state") +
+  labs(title = "Sample simulated sentence",
+       subtitle = "Tile colour = true language (hidden); text = observed POS tag",
+       x = "Position t", y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        panel.grid = element_blank())
+```
+
+------------------------------------------------------------------------
+
+## 4. Fitting the HMM and checking parameter recovery
+
+```{r}
+#Baum-Welch algorithm (EM)
+ntimes <- rep(SENT_LEN, N_SENTS)
+hmm_spec <- depmix(
+  response = obs_fac ~ 1,
+  data     = sim_df,
+  nstates  = 2,
+  family   = multinomial("identity"),
+  ntimes   = ntimes
+)
+
+set.seed(42)
+hmm_fit <- fit(hmm_spec,
+               emcontrol = em.control(maxit = 300, tol = 1e-6),
+               verbose   = FALSE)
+
+cat("Log-likelihood:", round(logLik(hmm_fit), 2), "\n")
+```
+
+```{r}
+# Extract estimated parameters
+pi_est  <- getpars(hmm_fit)[1:2]
+A_est   <- matrix(getpars(hmm_fit)[3:6], nrow = 2, byrow = TRUE)
+K <- 2
+em_off  <- 2 + K * K
+B_est   <- matrix(getpars(hmm_fit)[(em_off + 1):(em_off + K * V)],
+                  nrow = K, byrow = TRUE)
+
+# EM can swap state labels — align estimated states to true states by matching
+# emission distributions (whichever estimated state has higher P(det) = English)
+eng_state <- which.max(B_est[, 3])   # det = column 3 (English uses more det)
+spa_state <- 3 - eng_state
+if (eng_state == 2) {
+  pi_est <- rev(pi_est)
+  A_est  <- A_est[c(2,1), c(2,1)]
+  B_est  <- B_est[c(2,1), ]
+}
+
+cat("\n--- π (initial state probabilities) ---\n")
+cat(sprintf("  True:      eng=%.3f  spa=%.3f\n", pi_true[1], pi_true[2]))
+cat(sprintf("  Estimated: eng=%.3f  spa=%.3f\n", pi_est[1],  pi_est[2]))
+
+cat("\n--- A (transition matrix off-diagonals = switch rates) ---\n")
+cat(sprintf("  True switch rate:      %.4f\n", A_true[1, 2]))
+cat(sprintf("  Estimated switch rate: %.4f\n", A_est[1, 2]))
+
+cat("\n--- B (emission probabilities) ---\n")
+comp_B <- tibble(
+  POS       = POS_LABELS,
+  `True eng`  = round(B_true[1,], 3),
+  `Est. eng`  = round(B_est[1,],  3),
+  `True spa`  = round(B_true[2,], 3),
+  `Est. spa`  = round(B_est[2,],  3)
+)
+knitr::kable(comp_B, caption = "True vs estimated emission probabilities")
+```
+
+```{r}
+tibble(
+  pos       = rep(POS_LABELS, 4),
+  prob      = c(B_true[1,], B_est[1,], B_true[2,], B_est[2,]),
+  state     = rep(c("English mode", "Spanish mode"), each = V * 2),
+  source    = rep(rep(c("True", "Estimated"), each = V), 2)
+) |>
+  ggplot(aes(pos, prob, fill = source, alpha = source)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ state) +
+  scale_fill_manual(values = c(True = "grey30", Estimated = "#e08214")) +
+  scale_alpha_manual(values = c(True = 0.9, Estimated = 0.7)) +
+  labs(title = "Parameter recovery: true vs estimated B",
+       x = "POS tag", y = "Probability", fill = NULL, alpha = NULL) +
+  theme_minimal(base_size = 13)
+```
+
+
+
+------------------------------------------------------------------------
+
